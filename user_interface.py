@@ -23,6 +23,13 @@ except Exception:  # tzdata missing (some Windows installs)
 
 BASE_DIR = Path(__file__).parent
 
+# AI symptom extraction (needs llm_extraction.py, system_prompt.py, triage_rules.py, openai, OPENAI_API_KEY)
+try:
+    from llm_extraction import classify as ai_classify
+    AI_READY = True
+except Exception:
+    AI_READY = False
+
 
 def now_my() -> datetime.datetime:
     return datetime.datetime.now(MY_TZ) if MY_TZ else datetime.datetime.now()
@@ -34,6 +41,23 @@ def panel(name: str):
         return st.container(border=True, key=f"panel_{name}")
     except TypeError:
         return st.container(border=True)
+
+
+def build_patient_payload(age, gender_code: str, history: str, symptoms_lower: str) -> str:
+    """
+    Combine the separate form fields into one string with the exact layout the LLM
+    examples (ICL) use:   Age / Gender / History / Symptoms
+    Gender is always sent in English, whatever language the kiosk is showing.
+    """
+    gender_en = T["en"][gender_code]                      # "Male" / "Female" / "Other"
+    history_clean = " ".join(history.split()) or "None"
+    symptoms_clean = " ".join(symptoms_lower.split()).replace('"', "'")
+    return "\n".join([
+        f"Age: {age}",
+        f"Gender: {gender_en}",
+        f"History: {history_clean}",
+        f'Symptoms: "{symptoms_clean}"',
+    ])
 
 
 def file_to_data_uri(path: Path, mime: str) -> str:
@@ -74,7 +98,9 @@ T = {
         "general": "General condition", "conscious": "Conscious?", "gcs": "GCS score",
         "vitals": "Vital signs", "pulse": "Pulse", "resp": "Resp. rate", "bp": "BP",
         "spo2": "SpO2", "temp": "Temp", "pain": "Pain scale", "exam": "Examination findings",
-        "submit": "Submit",
+        "submit": "Get my triage result",
+        "analysing": "Analysing your symptoms...",
+        "detected": "Detected symptoms",
         "warn": "Chief complaint missing. Please describe your symptoms.",
         "status": "Status", "wait": "Wait time",
         "ticket": "Queue ticket", "queue_no": "Queue no.", "zone": "Zone",
@@ -110,7 +136,9 @@ T = {
         "vitals": "Tanda vital", "pulse": "Kadar nadi", "resp": "Kadar pernafasan",
         "bp": "Tekanan darah", "spo2": "SpO2", "temp": "Suhu badan",
         "pain": "Skala kesakitan", "exam": "Dapatan pemeriksaan",
-        "submit": "Hantar",
+        "submit": "Dapatkan keputusan saringan",
+        "analysing": "Menganalisis simptom anda...",
+        "detected": "Simptom dikesan",
         "warn": "Aduan utama tiada. Sila nyatakan simptom anda.",
         "status": "Status", "wait": "Masa menunggu",
         "ticket": "Tiket giliran", "queue_no": "No. giliran", "zone": "Zon",
@@ -481,18 +509,32 @@ with st.expander(t["staff"]):
 # ------------------------------------------------------------------
 st.write("")
 if st.button(t["submit"], type="primary", use_container_width=True):
-    user_input = symptoms.strip().lower()
+    raw_text = symptoms.strip()
+    user_input = raw_text.lower()
 
-    if not user_input:
+    if not raw_text:
         st.session_state.result = None
         st.warning(t["warn"])
     else:
-        if any(w in user_input for w in RED_WORDS) or conscious == "no":
-            zone = "red"
+        # Safety-net keyword rules (also the fallback when the AI step is unavailable or fails)
+        if any(w in user_input for w in RED_WORDS):
+            keyword_zone = "red"
         elif any(w in user_input for w in GREEN_WORDS):
-            zone = "green"
+            keyword_zone = "green"
         else:
-            zone = "amber"
+            keyword_zone = "amber"
+
+        zone, extracted = None, []
+        if AI_READY:
+            # Combine the separate form fields into one structured string for the LLM
+            combined_patient_data = build_patient_payload(age, gender, history, user_input)
+            with st.spinner(t["analysing"]):
+                # Step 1: LLM extracts symptoms. Step 2: rule-based engine (evaluate_triage_level) routes the zone.
+                zone, extracted = ai_classify(combined_patient_data)   # the patient's name is never sent
+        if zone is None:
+            zone = keyword_zone
+        if keyword_zone == "red" or conscious == "no":
+            zone = "red"          # never let the AI step downgrade an obvious emergency
 
         st.session_state.counters[zone] += 1
         st.session_state.result = {
@@ -501,6 +543,7 @@ if st.button(t["submit"], type="primary", use_container_width=True):
             "name": patient_name.strip(),
             "age": age,
             "gender": gender,
+            "symptoms": extracted,
             "stamp": now_my().strftime("%d/%m/%Y  %I:%M %p"),
         }
 
@@ -513,6 +556,14 @@ if res:
     zt = t[z]
     color = ZONE_COLOR[z]
 
+    detected = ", ".join(
+        str(x.get("name", x)) if isinstance(x, dict) else str(x) for x in res.get("symptoms", [])
+    )
+    detected_html = (
+        f'<div class="triage-fact" style="flex-basis:100%"><div class="k">{t["detected"]}</div>'
+        f'<div class="v">{html.escape(detected)}</div></div>' if detected else ""
+    )
+
     st.markdown(
         f'<div class="triage-card {"red" if z == "red" else ""}">'
         f'<div class="triage-top" style="background:{color}">'
@@ -520,7 +571,7 @@ if res:
         f'<div class="triage-body"><div class="triage-facts">'
         f'<div class="triage-fact"><div class="k">{t["status"]}</div><div class="v">{zt["status"]}</div></div>'
         f'<div class="triage-fact"><div class="k">{t["wait"]}</div><div class="v">{zt["wait"]}</div></div>'
-        f'</div><div class="triage-action" style="border-color:{color}">{zt["action"]}</div></div></div>',
+        f'{detected_html}</div><div class="triage-action" style="border-color:{color}">{zt["action"]}</div></div></div>',
         unsafe_allow_html=True,
     )
 
